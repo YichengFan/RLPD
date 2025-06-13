@@ -1,0 +1,16 @@
+﻿Product-ID;Produced on Machine 1;Produced on Machine 2;Produced on Machine 3;Produced quantity per shift (Machine 1);Produced quantity per shift (Machine 2);Produced quantity per shift (Machine 3);Starting Inventory;Price of Product
+ABC123;0;1;0;0;220;0;799;199,83
+ABC124;0;1;1;0;220;286;788;192,27
+ABC125;0;1;0;0;220;0;3479;190,57
+ABC126;0;1;0;0;220;0;8000;190,57
+ABC127;1;0;1;220;0;286;3258;169,27
+ABC128;1;0;1;220;0;286;40;169,27
+ABC129;1;0;1;150;0;195;42;263,37
+ABC130;1;0;1;150;0;195;209;266,03
+ABC131;1;0;1;150;0;195;94;288,28
+ABC132;1;0;1;150;0;195;295;330,76
+ABC133;1;0;1;150;0;195;350;336,89
+ABC134;1;0;1;150;0;195;310;354,57
+ABC135;1;0;0;150;0;0;670;302,39
+ABC136;1;0;0;150;0;0;370;307,56
+ABC137;1;0;0;150;0;0;294;331,63

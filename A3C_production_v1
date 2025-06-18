@@ -1,0 +1,120 @@
+import gym
+import numpy as np
+from gym import spaces
+
+# Custom Gym environment for production scheduling
+class ProductionEnv(gym.Env):
+    def __init__(self, forecast_data, master_data, switching_times, product_prices):
+        super(ProductionEnv, self).__init__()
+
+        self.forecast_data = forecast_data
+        self.master_data = master_data
+        self.switching_times = switching_times
+        self.product_prices = product_prices
+
+        self.products = list(master_data.keys())
+        self.machines = list(switching_times.keys())
+        self.week = 0
+        self.max_weeks = 52
+
+        # Observation space includes inventory levels, forecast values, and machine last-product state
+        obs_dim = len(self.products) * 2 + len(self.machines)
+        self.observation_space = spaces.Box(low=0, high=10000, shape=(obs_dim,), dtype=np.float32)
+
+        # Action space represents (machine, product, shift_count)
+        self.max_shifts = 5
+        self.action_space = spaces.Discrete(len(self.machines) * len(self.products) * self.max_shifts)
+
+        self.inventory = {product: 0 for product in self.products}
+        self.last_product = {machine: None for machine in self.machines}
+
+    def reset(self):
+        self.week = 0
+        self.inventory = {product: 0 for product in self.products}
+        self.last_product = {machine: None for machine in self.machines}
+        return self._get_obs()
+
+    def _get_obs(self):
+        obs = []
+        for product in self.products:
+            obs.append(self.inventory[product])
+            forecast = self._get_forecast(product)
+            obs.append(forecast)
+        for machine in self.machines:
+            last = self.last_product[machine]
+            obs.append(0 if last is None else self.products.index(last) + 1)
+        return np.array(obs, dtype=np.float32)
+
+    def _get_forecast(self, product):
+        # Dummy forecast placeholder
+        return 100
+
+    def _decode_action(self, action):
+        machine_idx = action // (len(self.products) * self.max_shifts)
+        rem = action % (len(self.products) * self.max_shifts)
+        product_idx = rem // self.max_shifts
+        shift_count = rem % self.max_shifts + 1
+        return self.machines[machine_idx], self.products[product_idx], shift_count
+
+    def step(self, action):
+        machine, product, shifts = self._decode_action(action)
+        prev_product = self.last_product[machine]
+        self.last_product[machine] = product
+
+        # Compute switching time if product is changed
+        switch_time = 0
+        if prev_product and prev_product != product:
+            switch_time = self.switching_times[machine].get(prev_product, {}).get(product, 0)
+
+        # Compute output based on hours
+        hourly_output = self.master_data[product].get(machine, 0) / 7  # per hour
+        total_output = hourly_output * 7 * shifts
+        self.inventory[product] += total_output
+
+        # Compute cost components
+        switch_cost = switch_time * hourly_output * self.product_prices[product]
+        inventory_cost = sum(v / 56 * 7.5 for v in self.inventory.values())
+        shipping_cost = 0  # Placeholder for later shipment logic
+
+        reward = -(1.0 * switch_cost + 0.5 * inventory_cost + 2.0 * shipping_cost)
+
+        self.week += 1
+        done = self.week >= self.max_weeks
+        return self._get_obs(), reward, done, {}
+
+    def render(self, mode="human"):
+        print(f"Week {self.week} Inventory: {self.inventory}")
+
+# === Environment Test ===
+
+products = ['ABC123', 'ABC124']
+machines = ['Machine 1']
+forecast_data = {}
+master_data = {
+    'ABC123': {'Machine 1': 700},
+    'ABC124': {'Machine 1': 600}
+}
+switching_times = {
+    'Machine 1': {
+        'ABC123': {'ABC124': 1},
+        'ABC124': {'ABC123': 2}
+    }
+}
+product_prices = {'ABC123': 100, 'ABC124': 120}
+
+# Create environment
+env = ProductionEnv(forecast_data, master_data, switching_times, product_prices)
+
+# Reset environment and print initial state
+obs = env.reset()
+print("Initial observation: [ ABC123 inventory, ABC123 forecast, ABC124 inventory, ABC124 forecast, Machine1_last_product_index ]")
+print("                     =", obs)
+
+# Sample action: Machine 1, Product ABC123, 1 shift
+action = 0
+next_obs, reward, done, _ = env.step(action)
+
+print("Next observation:   [ ABC123 inventory, ABC123 forecast, ABC124 inventory, ABC124 forecast, Machine1_last_product_index ]")
+print("                     =", next_obs)
+print("Reward:", reward)
+print("Done:", done)

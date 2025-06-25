@@ -6,6 +6,7 @@ import torch.nn as nn
 import torch.optim as optim
 from collections import deque
 from production_env_dqn import ProductionSchedulingEnv
+import matplotlib.pyplot as plt
 
 # 1) Q‐Network
 class DQN(nn.Module):
@@ -28,12 +29,12 @@ class DQNAgent:
         self,
         state_dim,
         action_dim,
-        lr=1e-3,
+        lr=5e-5,
         gamma=0.99,
         buffer_size=100_000,
-        batch_size=64,
+        batch_size=128,
         eps_start=1.0,
-        eps_decay=0.995,
+        eps_decay=0.9995,
         eps_min=0.05,
         target_update_steps=1000
     ):
@@ -46,7 +47,7 @@ class DQNAgent:
         self.optimizer = optim.Adam(self.policy_net.parameters(), lr=lr)
         self.criterion = nn.MSELoss()
 
-        self.memory = deque(maxlen=buffer_size)
+        self.memory = PrioritizedReplayBuffer(capacity=100000, alpha=0.6)
         self.batch_size = batch_size
         self.gamma = gamma
 
@@ -64,54 +65,92 @@ class DQNAgent:
             qvals = self.policy_net(state_t)
         return int(qvals.argmax(dim=1).item())
 
-    def store_transition(self, s, a, r, s_next, done):
-        self.memory.append((s, a, r, s_next, done))
+    def store_transition(self, state, action, reward, next_state, done):
+        # PER: priority will default to current max so new samples get drawn
+        transition = (state, action, reward, next_state, done)
+        self.memory.add(transition)
 
     def update(self):
-        if len(self.memory) < self.batch_size:
+        # only start when buffer big enough
+        if not self.memory.full and self.memory.pos < self.batch_size:
             return
 
-        batch = random.sample(self.memory, self.batch_size)
-        states, actions, rewards, next_states, dones = zip(*batch)
+        # 1) PER sampling
+        beta = 0.4  # you can ramp this to 1.0 over time
+        st, ac, rw, ns, dn, idxs, wts = \
+            self.memory.sample(self.batch_size, beta)
 
-        # Convert lists of numpy arrays into 2D arrays for fast tensor conversion
-        # states_arr: shape [batch_size, state_dim]
-        states_arr = np.stack(states).astype(np.float32)
-
-        # next_states may contain None for terminals—replace with zeros
-        zero_state = np.zeros_like(states_arr[0])
-        next_states_arr = np.stack([
-            ns if ns is not None else zero_state
-            for ns in next_states
-        ]).astype(np.float32)
-
-        # Now move to torch tensors in one go
+        # 2) convert to tensors (same as before), plus wts
+        states_arr = np.stack(st).astype(np.float32)
+        next_arr = np.stack([x if x is not None else np.zeros_like(states_arr[0])
+                             for x in ns]).astype(np.float32)
         states_t = torch.from_numpy(states_arr).to(self.device)
-        actions_t = torch.tensor(actions, dtype=torch.int64, device=self.device).unsqueeze(1)
-        rewards_t = torch.tensor(rewards, dtype=torch.float32, device=self.device).unsqueeze(1)
-        next_states_t = torch.from_numpy(next_states_arr).to(self.device)
-        dones_t = torch.tensor(dones, dtype=torch.float32, device=self.device).unsqueeze(1)
+        next_t = torch.from_numpy(next_arr).to(self.device)
+        actions_t = torch.tensor(ac, dtype=torch.int64, device=self.device).unsqueeze(1)
+        rewards_t = torch.tensor(rw, dtype=torch.float32, device=self.device).unsqueeze(1)
+        dones_t = torch.tensor(dn, dtype=torch.float32, device=self.device).unsqueeze(1)
+        weights_t = torch.tensor(wts, dtype=torch.float32, device=self.device).unsqueeze(1)
 
-        # Current Q estimates
+        # 3) Q‐value & target (Double‐DQN)
         q_pred = self.policy_net(states_t).gather(1, actions_t)
-
-        # Compute targets with target network
         with torch.no_grad():
-            q_next = self.target_net(next_states_t).max(dim=1, keepdim=True)[0]
+            best_a = self.policy_net(next_t).argmax(dim=1, keepdim=True)
+            q_next = self.target_net(next_t).gather(1, best_a)
             q_target = rewards_t + (1 - dones_t) * self.gamma * q_next
 
-        # MSE loss and optimize
-        loss = self.criterion(q_pred, q_target)
+        # 4) weighted loss
+        loss = (weights_t * (q_pred - q_target).pow(2)).mean()
         self.optimizer.zero_grad()
         loss.backward()
         self.optimizer.step()
 
-        # Update ε and target network
+        # 5) update priorities
+        td_errors = (q_pred - q_target).abs().detach().cpu().squeeze().numpy()
+        new_prios = td_errors + 1e-6
+        self.memory.update_priorities(idxs, new_prios)
+
+        # 6) target‐net sync & epsilon decay (unchanged)
         self.learn_steps += 1
         if self.learn_steps % self.target_update_steps == 0:
             self.target_net.load_state_dict(self.policy_net.state_dict())
-
         self.epsilon = max(self.epsilon * self.eps_decay, self.eps_min)
+
+
+#优先经验回放
+class PrioritizedReplayBuffer:
+    def __init__(self, capacity, alpha=0.6):
+        self.capacity = capacity
+        self.alpha    = alpha
+        self.pos      = 0
+        self.full     = False
+        self.buffer   = [None] * capacity
+        self.prios    = np.zeros((capacity,), dtype=np.float32)
+
+    def add(self, transition, priority=None):
+        max_prio = self.prios.max() if self.full else (self.prios[:self.pos].max() if self.pos>0 else 1.0)
+        self.buffer[self.pos] = transition
+        self.prios[self.pos]  = priority if priority is not None else max_prio
+        self.pos += 1
+        if self.pos >= self.capacity:
+            self.pos  = 0
+            self.full = True
+
+    def sample(self, batch_size, beta=0.4):
+        total = self.capacity if self.full else self.pos
+        prios = self.prios[:total]
+        probs = prios ** self.alpha
+        P     = probs / probs.sum()
+        indices= np.random.choice(total, batch_size, p=P)
+        samples= [self.buffer[i] for i in indices]
+        weights= (total * P[indices]) ** (-beta)
+        weights/= weights.max()
+        states, actions, rewards, next_states, dones = zip(*samples)
+        return states, actions, rewards, next_states, dones, indices, weights
+
+    def update_priorities(self, indices, priorities):
+        for idx, pr in zip(indices, priorities):
+            self.prios[idx] = pr
+
 
 
 # 3) Expert schedule loader
@@ -144,19 +183,20 @@ def load_expert_schedule(path, env):
 
         p_idx = env.product_idx[material]
         s_idx = 0  # no shipment in expert data
-        action = (
-            m_idx * (env.num_products * env.num_shipment_types)
-            + p_idx * env.num_shipment_types
-            + s_idx
-        )
-        actions.append(action)
+
+        triplet = (m_idx, p_idx, 0)
+        if triplet in env.valid_actions:
+            action = env.valid_actions.index(triplet)
+            actions.append(action)
+        else:
+            continue
 
     return actions
 
 
 # 4) Training loop with imitation
 def train_dqn(
-    num_episodes=500,
+    num_episodes=5000,
     pretrain_steps=10000,
     save_every=50,
     model_path='dqn_real'
@@ -164,16 +204,17 @@ def train_dqn(
     env = ProductionSchedulingEnv()
     state_dim  = env.observation_space.shape[0]
     action_dim = env.action_space.n
+    reward_history = []
 
     agent = DQNAgent(
         state_dim=state_dim,
         action_dim=action_dim,
-        lr=1e-3,
+        lr=5e-5,
         gamma=0.99,
         buffer_size=100_000,
-        batch_size=64,
+        batch_size=128,
         eps_start=1.0,
-        eps_decay=0.995,
+        eps_decay=0.9997,
         eps_min=0.05,
         target_update_steps=1000
     )
@@ -202,13 +243,29 @@ def train_dqn(
             state = next_state
             total_reward += reward
 
+        reward_history.append(total_reward)
+
         print(f"Episode {ep}/{num_episodes}  Reward: {total_reward:.2f}  Epsilon: {agent.epsilon:.3f}")
         if ep % save_every == 0:
             torch.save(agent.policy_net.state_dict(), f"{model_path}_ep{ep}.pth")
 
     # final save
+    plt.figure(figsize=(8, 4))
+    plt.plot(reward_history)
+    ma = np.convolve(reward_history, np.ones(50) / 50, mode='valid')
+    plt.plot(range(50, len(reward_history) + 1), ma, color='red', label='50-ep MA')
+    plt.legend()
+    plt.xlabel('Episode')
+    plt.ylabel('Total Reward')
+    plt.title('Training Curve eps5000')
+    plt.grid(True)
+    plt.show()
     torch.save(agent.policy_net.state_dict(), f"{model_path}_final.pth")
+
+
+
     print("Training complete, models saved.")
+
 
 if __name__ == '__main__':
     train_dqn()

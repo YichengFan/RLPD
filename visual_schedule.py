@@ -44,8 +44,8 @@ def plot_production_schedule(df):
     ax.set_ylabel("Machine", fontsize=14, fontweight='bold')
 
     # Format x-axis (Weekdays)
-    ax.set_xlim(start_date, end_date)
-    ax.set_xticks(all_dates)
+    ax.set_xlim(start_date, end_date + timedelta(days=1))
+    ax.set_xticks(all_dates[all_dates <= end_date])
     ax.xaxis.set_major_locator(mdates.DayLocator())
     ax.xaxis.set_major_formatter(mdates.DateFormatter('%a'))
     plt.setp(ax.get_xticklabels(), rotation=0, ha='center', fontsize=8)
@@ -60,7 +60,7 @@ def plot_production_schedule(df):
     # Bottom calendar week + year axis
     week_labels = [f"KW {d.isocalendar().week}\n{d.isocalendar().year}" for d in week_starts]
     week_midpoints = [d + timedelta(days=3) for d in week_starts]
-    ax2.set_xlim(start_date, end_date)
+    ax2.set_xlim(start_date, end_date + timedelta(days=1))
     ax2.set_xticks(week_midpoints)
     ax2.set_xticklabels(week_labels, fontsize=9, fontweight='bold')
     ax2.spines['bottom'].set_visible(False)
@@ -78,6 +78,11 @@ def plot_production_schedule(df):
     plt.tight_layout()
     plt.grid(axis='x', linestyle='--', alpha=0.2)
     plt.show()
+
+df = pd.read_csv('Production_Schedules.csv')
+
+# Plot
+plot_production_schedule(df)
 
 df = pd.read_csv('Production_Schedules.csv')
 

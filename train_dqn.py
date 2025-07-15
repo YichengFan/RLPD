@@ -5,40 +5,50 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from collections import deque
-from production_env_dqn import ProductionSchedulingEnv
+from production_env_dqn_sfts import ProductionSchedulingEnv
+import matplotlib
+matplotlib.use('TkAgg')
 import matplotlib.pyplot as plt
 
 # 1) Q‐Network
 class DQN(nn.Module):
-    def __init__(self, input_dim, output_dim):
+    def __init__(self, input_dim, action_dim):
         super().__init__()
+        self.input_dim = input_dim
+        self.action_dim = action_dim  # array/list, e.g. [4,4,4]
+        self.num_machines = len(action_dim)
+        self.total_actions = sum(action_dim)
         self.net = nn.Sequential(
             nn.Linear(input_dim, 128),
             nn.ReLU(),
             nn.Linear(128, 128),
             nn.ReLU(),
-            nn.Linear(128, output_dim)
+            nn.Linear(128, self.total_actions)
         )
 
     def forward(self, x):
-        return self.net(x)
+        out = self.net(x)  # (batch, total_actions)
+        splits = torch.split(out, tuple(self.action_dim), dim=-1)
+        return splits  # tuple，每台机器一段
 
 # 2) Agent
 class DQNAgent:
     def __init__(
         self,
         state_dim,
-        action_dim,
+        action_dim,  # array/list, e.g. [4,4,4]
         lr=5e-5,
         gamma=0.99,
         buffer_size=100_000,
         batch_size=128,
         eps_start=1.0,
-        eps_decay=0.9995,
+        eps_decay=0.973,  # 250 episode内从1.0到0.05
         eps_min=0.05,
         target_update_steps=1000
     ):
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.action_dim = action_dim
+        self.num_machines = len(action_dim)
         self.policy_net = DQN(state_dim, action_dim).to(self.device)
         self.target_net = DQN(state_dim, action_dim).to(self.device)
         self.target_net.load_state_dict(self.policy_net.state_dict())
@@ -58,62 +68,58 @@ class DQNAgent:
         self.target_update_steps = target_update_steps
 
     def select_action(self, state):
-        if random.random() < self.epsilon:
-            return random.randrange(self.policy_net.net[-1].out_features)
         state_t = torch.tensor(state, dtype=torch.float32, device=self.device).unsqueeze(0)
-        with torch.no_grad():
-            qvals = self.policy_net(state_t)
-        return int(qvals.argmax(dim=1).item())
+        splits = self.policy_net(state_t)
+        action = []
+        for logits in splits:
+            if random.random() < self.epsilon:
+                a = random.randrange(logits.shape[-1])
+            else:
+                a = int(logits.argmax(dim=-1).item())
+            action.append(a)
+        return np.array(action, dtype=np.int64)
 
     def store_transition(self, state, action, reward, next_state, done):
-        # PER: priority will default to current max so new samples get drawn
+        # action: np.array or list
         transition = (state, action, reward, next_state, done)
         self.memory.add(transition)
 
     def update(self):
-        # only start when buffer big enough
         if not self.memory.full and self.memory.pos < self.batch_size:
             return
-
-        # 1) PER sampling
-        beta = 0.4  # you can ramp this to 1.0 over time
-        st, ac, rw, ns, dn, idxs, wts = \
-            self.memory.sample(self.batch_size, beta)
-
-        # 2) convert to tensors (same as before), plus wts
+        beta = 0.4
+        st, ac, rw, ns, dn, idxs, wts = self.memory.sample(self.batch_size, beta)
         states_arr = np.stack(st).astype(np.float32)
-        next_arr = np.stack([x if x is not None else np.zeros_like(states_arr[0])
-                             for x in ns]).astype(np.float32)
+        next_arr = np.stack([x if x is not None else np.zeros_like(states_arr[0]) for x in ns]).astype(np.float32)
         states_t = torch.from_numpy(states_arr).to(self.device)
         next_t = torch.from_numpy(next_arr).to(self.device)
-        actions_t = torch.tensor(ac, dtype=torch.int64, device=self.device).unsqueeze(1)
+        actions_arr = np.stack(ac).astype(np.int64)  # (batch, num_machines)
         rewards_t = torch.tensor(rw, dtype=torch.float32, device=self.device).unsqueeze(1)
         dones_t = torch.tensor(dn, dtype=torch.float32, device=self.device).unsqueeze(1)
         weights_t = torch.tensor(wts, dtype=torch.float32, device=self.device).unsqueeze(1)
 
-        # 3) Q‐value & target (Double‐DQN)
-        q_pred = self.policy_net(states_t).gather(1, actions_t)
-        with torch.no_grad():
-            best_a = self.policy_net(next_t).argmax(dim=1, keepdim=True)
-            q_next = self.target_net(next_t).gather(1, best_a)
-            q_target = rewards_t + (1 - dones_t) * self.gamma * q_next
-
-        # 4) weighted loss
-        loss = (weights_t * (q_pred - q_target).pow(2)).mean()
+        # Q-value & target for each machine
+        q_pred_all = self.policy_net(states_t)  # tuple of (batch, n_i)
+        q_next_all = self.target_net(next_t)
+        loss = 0.0
+        for m in range(self.num_machines):
+            q_pred = q_pred_all[m].gather(1, torch.tensor(actions_arr[:, m], device=self.device).unsqueeze(1))
+            with torch.no_grad():
+                best_a = q_pred_all[m].argmax(dim=1, keepdim=True)
+                q_next = q_next_all[m].gather(1, best_a)
+                q_target = rewards_t + (1 - dones_t) * self.gamma * q_next
+            loss += (weights_t * (q_pred - q_target).pow(2)).mean()
+        loss = loss / self.num_machines
         self.optimizer.zero_grad()
         loss.backward()
         self.optimizer.step()
-
-        # 5) update priorities
-        td_errors = (q_pred - q_target).abs().detach().cpu().squeeze().numpy()
+        td_errors = torch.abs(q_pred - q_target).detach().cpu().squeeze().numpy()
         new_prios = td_errors + 1e-6
         self.memory.update_priorities(idxs, new_prios)
-
-        # 6) target‐net sync & epsilon decay (unchanged)
         self.learn_steps += 1
         if self.learn_steps % self.target_update_steps == 0:
             self.target_net.load_state_dict(self.policy_net.state_dict())
-        self.epsilon = max(self.epsilon * self.eps_decay, self.eps_min)
+        # self.epsilon = max(self.epsilon * self.eps_decay, self.eps_min)  # 移除
 
 
 #优先经验回放
@@ -196,14 +202,14 @@ def load_expert_schedule(path, env):
 
 # 4) Training loop with imitation
 def train_dqn(
-    num_episodes=5000,
+    num_episodes=250,
     pretrain_steps=10000,
     save_every=50,
     model_path='dqn_real'
 ):
     env = ProductionSchedulingEnv()
     state_dim  = env.observation_space.shape[0]
-    action_dim = env.action_space.n
+    action_dim = env.action_space.nvec  # array([num_products+1,...])
     reward_history = []
 
     agent = DQNAgent(
@@ -214,40 +220,37 @@ def train_dqn(
         buffer_size=100_000,
         batch_size=128,
         eps_start=1.0,
-        eps_decay=0.9997,
+        eps_decay=0.973,
         eps_min=0.05,
         target_update_steps=1000
     )
-
-    # Imitation pretrain
-    expert_actions = load_expert_schedule('Production_Schedules.csv', env)
-    state = env.reset()
-    for a in expert_actions:
-        next_state, reward, done, _ = env.step(a)
-        agent.store_transition(state, a, reward, next_state, done)
-        state = next_state
-        if done: break
-    for _ in range(pretrain_steps):
-        agent.update()
 
     # RL training
     for ep in range(1, num_episodes + 1):
         state = env.reset()
         total_reward = 0.0
         done = False
+        step = 0
         while not done:
-            action, = [agent.select_action(state)]
+            action = agent.select_action(state)
             next_state, reward, done, _ = env.step(action)
             agent.store_transition(state, action, reward, next_state, done)
-            agent.update()
+            if step % 10 == 0:
+                agent.update()
             state = next_state
             total_reward += reward
+            step += 1
 
         reward_history.append(total_reward)
+        # episode结束后衰减epsilon
+        agent.epsilon = max(agent.epsilon * agent.eps_decay, agent.eps_min)
 
         print(f"Episode {ep}/{num_episodes}  Reward: {total_reward:.2f}  Epsilon: {agent.epsilon:.3f}")
         if ep % save_every == 0:
             torch.save(agent.policy_net.state_dict(), f"{model_path}_ep{ep}.pth")
+
+    # 输出csv
+    env.export_records(flat_csv='shift_flat.csv', pivot_csv='shift_pivot.csv')
 
     # final save
     plt.figure(figsize=(8, 4))
@@ -257,7 +260,7 @@ def train_dqn(
     plt.legend()
     plt.xlabel('Episode')
     plt.ylabel('Total Reward')
-    plt.title('Training Curve eps5000')
+    plt.title('Training Curve eps250')
     plt.grid(True)
     plt.show()
     torch.save(agent.policy_net.state_dict(), f"{model_path}_final.pth")

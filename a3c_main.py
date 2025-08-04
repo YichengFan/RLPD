@@ -135,9 +135,9 @@ if __name__ == "__main__":
 
     # Print total reward
     total_reward = sum(results)
-    print("\n✅ Training completed.")
-    print(f"🏁 Total reward over {MAX_EPISODES} episodes: {total_reward:.2f}")
+    print("\nTraining completed.")
+    print(f"Total reward over {MAX_EPISODES} episodes: {total_reward:.2f}")
 
     # Save the model
     global_model.save("a3c_production_model.h5")
-    print("💾 Model saved as 'a3c_production_model.h5'")
+    print("Model saved as 'a3c_production_model.h5'")

@@ -3,7 +3,6 @@ import numpy as np
 import tensorflow as tf
 import multiprocessing as mp
 import os
-import time
 
 # Global variables
 ENV_NAME = "CartPole-v1"

@@ -60,7 +60,7 @@ class ProductionSchedulingEnv(gym.Env):
 
         # --- Action/Observation Space ---
         self.action_space = spaces.MultiDiscrete([self.num_products+1]*self.num_machines)
-        obs_dim = self.num_products + self.num_machines + 2  # 库存+机器上次产什么+当前日期/班次
+        obs_dim = self.num_products + self.num_machines + 2  
         self.observation_space = spaces.Box(low=-np.inf, high=np.inf, shape=(obs_dim,), dtype=np.float32)
 
         # --- Internal State ---
@@ -74,7 +74,7 @@ class ProductionSchedulingEnv(gym.Env):
         self.records = []  # for csv output
 
     def reset(self):
-        self.inventory = {p: 0.0 for p in self.products}  # 初始库存全为0
+        self.inventory = {p: 0.0 for p in self.products}  
         self.prev_assign = [None]*self.num_machines
         self.current_date = self.start_date
         self.current_shift = 0
@@ -92,7 +92,7 @@ class ProductionSchedulingEnv(gym.Env):
         return np.concatenate([inv, prev, [t1, t2]])
 
     def step(self, action):
-        # action: array, 每台机器本班次产什么/不产（0=不产, 1~N=产第i个产品）
+
         produced = {p:0.0 for p in self.products}
         cost_sw = 0.0
         for m in range(self.num_machines):
@@ -102,7 +102,6 @@ class ProductionSchedulingEnv(gym.Env):
                 continue
             prod = self.products[prod_idx]
             prev = self.prev_assign[m]
-            # 切换损失
             if (
                 prev is not None
                 and prev in self.switching_losses[m].index
@@ -116,10 +115,8 @@ class ProductionSchedulingEnv(gym.Env):
             produced[prod] += real_prod
             cost_sw += lost_shifts * base * self.price[prod]
             self.prev_assign[m] = prod
-        # 更新库存
         for p in self.products:
             self.inventory[p] += produced[p]
-        # 记录本班次生产
         self.records.append({
             'Date': self.current_date.strftime('%Y-%m-%d'),
             'Shift': self.current_shift+1,
@@ -127,10 +124,8 @@ class ProductionSchedulingEnv(gym.Env):
             'Action': action.copy(),
             'Inventory': self.inventory.copy()
         })
-        # 发货/需求/罚款
         reward = 0.0
         pen_stock = 0.0
-        # 检查是否为发货日
         today_mask = self.forecast_df['Forecast_Target_Date'] == self.current_date.strftime('%Y-%m-%d')
         if today_mask.any():
             today_df = self.forecast_df[today_mask]
@@ -144,14 +139,12 @@ class ProductionSchedulingEnv(gym.Env):
                 else:
                     self.inventory[prod] -= demand
         reward -= pen_stock / 1e5
-        # 推进班次/日期
         self.current_shift += 1
         done = False
         if self.current_shift >= self.shifts_per_day:
             self.current_shift = 0
             self.current_date += datetime.timedelta(days=1)
             self.day_idx += 1
-            # 跳过非生产日
             while self.current_date.weekday() not in self.production_days:
                 self.current_date += datetime.timedelta(days=1)
                 self.day_idx += 1
@@ -166,7 +159,6 @@ class ProductionSchedulingEnv(gym.Env):
         print(" Inventory:", invs, "\n")
 
     def export_records(self, flat_csv='shift_flat.csv', pivot_csv='shift_pivot.csv', year_filter=2025):
-        # 扁平csv
         flat = []
         for rec in self.records:
             for m, prod in enumerate(rec['Action']):
@@ -175,7 +167,7 @@ class ProductionSchedulingEnv(gym.Env):
                 qty = rec['Machine_Production'][self.products[prod_idx]] if prod_idx >= 0 else 0.0
                 date_obj = pd.to_datetime(rec['Date'])
                 if date_obj.year < year_filter:
-                    continue  # 只保留今年及以后
+                    continue  
                 flat.append({
                     'Date': rec['Date'],
                     'Shift': rec['Shift'],
@@ -185,13 +177,11 @@ class ProductionSchedulingEnv(gym.Env):
                     'Inventory': rec['Inventory'][prod_name] if prod_name != 'None' else 0.0
                 })
         pd.DataFrame(flat).to_csv(flat_csv, index=False)
-        # 透视csv（每天每产品总产量）
         df = pd.DataFrame(flat)
         if not df.empty:
             pivot = df.groupby(['Date','Product'])['Quantity'].sum().unstack(fill_value=0)
             pivot.to_csv(pivot_csv)
         else:
-            # 如果没有数据，导出空表
             pd.DataFrame().to_csv(pivot_csv)
 
 if __name__=='__main__':

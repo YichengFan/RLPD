@@ -4,7 +4,6 @@ import pandas as pd
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from collections import deque
 from production_env_dqn_sfts import ProductionSchedulingEnv
 import matplotlib
 matplotlib.use('TkAgg')
@@ -29,7 +28,7 @@ class DQN(nn.Module):
     def forward(self, x):
         out = self.net(x)  # (batch, total_actions)
         splits = torch.split(out, tuple(self.action_dim), dim=-1)
-        return splits  # tuple，每台机器一段
+        return splits  # tuple
 
 # 2) Agent
 class DQNAgent:
@@ -42,7 +41,7 @@ class DQNAgent:
         buffer_size=100_000,
         batch_size=128,
         eps_start=1.0,
-        eps_decay=0.973,  # 250 episode内从1.0到0.05
+        eps_decay=0.973,  
         eps_min=0.05,
         target_update_steps=1000
     ):
@@ -119,10 +118,7 @@ class DQNAgent:
         self.learn_steps += 1
         if self.learn_steps % self.target_update_steps == 0:
             self.target_net.load_state_dict(self.policy_net.state_dict())
-        # self.epsilon = max(self.epsilon * self.eps_decay, self.eps_min)  # 移除
-
-
-#优先经验回放
+        # self.epsilon = max(self.epsilon * self.eps_decay, self.eps_min)  
 class PrioritizedReplayBuffer:
     def __init__(self, capacity, alpha=0.6):
         self.capacity = capacity
@@ -242,14 +238,12 @@ def train_dqn(
             step += 1
 
         reward_history.append(total_reward)
-        # episode结束后衰减epsilon
         agent.epsilon = max(agent.epsilon * agent.eps_decay, agent.eps_min)
 
         print(f"Episode {ep}/{num_episodes}  Reward: {total_reward:.2f}  Epsilon: {agent.epsilon:.3f}")
         if ep % save_every == 0:
             torch.save(agent.policy_net.state_dict(), f"{model_path}_ep{ep}.pth")
 
-    # 输出csv
     env.export_records(flat_csv='shift_flat.csv', pivot_csv='shift_pivot.csv')
 
     # final save

@@ -2,29 +2,37 @@ import numpy as np
 import tensorflow as tf
 import multiprocessing as mp
 import os
+import matplotlib.pyplot as plt
+import pandas as pd
 import time
+start_time = time.time()
+
 from production_env import ProductionSchedulingEnv
 
-# Global variables
+# Config
 NUM_WORKERS = mp.cpu_count()
-MAX_EPISODES = 2000
+ADDITIONAL_EPISODES = 10000
 GAMMA = 0.99
-ENTROPY_BETA = 0.01
-LR = 0.0001
+ENTROPY_BETA = 0.001
+LR = 0.0003
+MODEL_PATH = None
+NEW_MODEL_PATH = "a3c_lstm_regionaware_model_0001.h5"
+REWARD_LOG = "training_rewards_lstm.txt"
 
 @tf.keras.utils.register_keras_serializable()
 class ACModel(tf.keras.Model):
     def __init__(self, action_space, **kwargs):
         super().__init__(**kwargs)
         self.action_space = action_space
-        self.dense1 = tf.keras.layers.Dense(256, activation='relu')
-        self.dense2 = tf.keras.layers.Dense(128, activation='relu')
+        self.dense1 = tf.keras.layers.Dense(128, activation='relu')
+        self.lstm = tf.keras.layers.LSTM(128)
         self.policy_logits = tf.keras.layers.Dense(action_space)
         self.value = tf.keras.layers.Dense(1)
 
     def call(self, inputs):
         x = self.dense1(inputs)
-        x = self.dense2(x)
+        x = tf.expand_dims(x, axis=1)
+        x = self.lstm(x)
         return self.policy_logits(x), self.value(x)
 
     def get_config(self):
@@ -34,7 +42,9 @@ class ACModel(tf.keras.Model):
 
     @classmethod
     def from_config(cls, config):
-        return cls(**config)
+        action_space = config.pop("action_space")
+        return cls(action_space=action_space, **config)
+
 
 class Worker(mp.Process):
     def __init__(self, global_model, optimizer, result_queue, worker_id):
@@ -45,7 +55,10 @@ class Worker(mp.Process):
         self.worker_id = worker_id
         self.env = ProductionSchedulingEnv()
         self.local_model = ACModel(self.env.action_space.n)
-        self.ep_loss = 0.0
+
+        dummy_input = tf.convert_to_tensor(np.random.random((1, self.env.observation_space.shape[0])), dtype=tf.float32)
+        self.local_model(dummy_input)
+        self.local_model.set_weights(self.global_model.get_weights())
         self.episode_count = 0
 
     def run(self):
@@ -54,9 +67,10 @@ class Worker(mp.Process):
             state = self.env.reset()
             state = np.expand_dims(state, axis=0).astype(np.float32)
             buffer_states, buffer_actions, buffer_rewards = [], [], []
-
             ep_reward = 0
-            for _ in range(200):
+            done = False
+
+            while not done:
                 logits, _ = self.local_model(state)
                 probs = tf.nn.softmax(logits)
                 action = np.random.choice(self.env.action_space.n, p=probs.numpy()[0])
@@ -67,20 +81,23 @@ class Worker(mp.Process):
                 buffer_actions.append(action)
                 buffer_rewards.append(reward)
 
-                if done or next_state is None:
-                    break
+                if not done:
+                    state = np.expand_dims(next_state, axis=0).astype(np.float32)
+                    total_step += 1
 
-                state = np.expand_dims(next_state, axis=0).astype(np.float32)
-                total_step += 1
-
-            self.update_global(buffer_states, buffer_actions, buffer_rewards)
+            self.update_global(buffer_states, buffer_actions, buffer_rewards, state, done)
             self.episode_count += 1
             print(f"[Worker {self.worker_id}] Episode {self.episode_count} reward: {ep_reward:.2f}")
             self.result_queue.put(ep_reward)
 
-    def update_global(self, states, actions, rewards):
+    def update_global(self, states, actions, rewards, last_state, done):
         discounted_rewards = []
-        R = 0
+        if not done:
+            _, last_value = self.local_model(last_state)
+            R = tf.squeeze(last_value).numpy()
+        else:
+            R = 0
+
         for r in rewards[::-1]:
             R = r + GAMMA * R
             discounted_rewards.insert(0, R)
@@ -109,14 +126,29 @@ class Worker(mp.Process):
 
 if __name__ == "__main__":
     os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
-    print("Starting A3C with", NUM_WORKERS, "workers")
+    print(f"🚀 Starting LSTM-based A3C with {NUM_WORKERS} workers")
 
     env = ProductionSchedulingEnv()
     global_model = ACModel(env.action_space.n)
-    global_model(tf.convert_to_tensor(np.random.random((1, env.observation_space.shape[0])), dtype=tf.float32))
+    dummy_input = tf.convert_to_tensor(np.random.random((1, env.observation_space.shape[0])), dtype=tf.float32)
+    global_model(dummy_input)
 
-    optimizer = tf.keras.optimizers.Adam(LR)
+    if MODEL_PATH and os.path.exists(MODEL_PATH):
+        global_model.load_weights(MODEL_PATH)
+        print(f"✅ Loaded weights from {MODEL_PATH}")
+    else:
+        print("🆕 Starting training from scratch (no preloaded weights)")
+
+    optimizer = tf.keras.optimizers.Adam(learning_rate=LR)
     result_queue = mp.Queue()
+
+    try:
+        with open(REWARD_LOG, "r") as f:
+            results = [float(line.strip()) for line in f.readlines()]
+        start_episode = len(results)
+    except:
+        results = []
+        start_episode = 0
 
     workers = []
     for i in range(NUM_WORKERS):
@@ -124,20 +156,29 @@ if __name__ == "__main__":
         worker.start()
         workers.append(worker)
 
-    results = []
-    for ep in range(MAX_EPISODES):
+    for ep in range(start_episode, start_episode + ADDITIONAL_EPISODES):
         r = result_queue.get()
         results.append(r)
         print(f"Episode {ep} reward: {r:.2f}")
 
-    # Terminate workers
+        if (ep + 1) % 500 == 0:
+            with open(REWARD_LOG, "w") as f:
+                for val in results:
+                    f.write(f"{val}\n")
+            print(f"💾 Progress saved at episode {ep + 1}")
+
     [w.terminate() for w in workers]
 
-    # Print total reward
     total_reward = sum(results)
-    print("\nTraining completed.")
-    print(f"Total reward over {MAX_EPISODES} episodes: {total_reward:.2f}")
+    print("\n✅ Training complete.")
+    print(f"🏁 Final reward over {len(results)} episodes: {total_reward:.2f}")
 
-    # Save the model
-    global_model.save("a3c_production_model.h5")
-    print("Model saved as 'a3c_production_model.h5'")
+    with open(REWARD_LOG, "w") as f:
+        for r in results:
+            f.write(f"{r}\n")
+
+    global_model.save(NEW_MODEL_PATH)
+    print(f"💾 Model saved as '{NEW_MODEL_PATH}'")
+    end_time = time.time()
+    training_time_hrs = (end_time - start_time) / 3600
+    print(f"⏱️ Total Training Time: {training_time_hrs:.2f} hours")
